@@ -445,3 +445,181 @@ vllm serve MODEL 2>&1 | tee vllm_debug.log
 # - Full command used
 # - Expected vs actual behavior
 ```
+
+## v0.24.0 Troubleshooting
+
+### `CUDA_VISIBLE_DEVICES` no longer restricting GPUs
+
+**Cause**: v0.24.0 no longer sets `CUDA_VISIBLE_DEVICES` internally based on the env var alone during server startup.
+
+**Solution**: Use the `--device-ids` flag explicitly:
+
+```bash
+# Instead of relying on CUDA_VISIBLE_DEVICES alone:
+CUDA_VISIBLE_DEVICES=0,1 vllm serve MODEL  # may not work as expected
+
+# Use --device-ids (works correctly in v0.24.0):
+vllm serve MODEL --device-ids 0,1
+```
+
+### GGUF model not loading
+
+**Cause**: GGUF support has been moved out of core vLLM into a plugin package as of v0.24.0.
+
+**Solution**: Install the GGUF plugin:
+
+```bash
+pip install vllm-gguf
+
+# Then launch normally:
+vllm serve /path/to/model.gguf
+```
+
+If you see `ValueError: Model type gguf not supported`, the plugin is missing or failed to import.
+
+### KV cache preemptions (throughput drops, requests stall)
+
+**Symptom**: Logs show `Preemption: X sequence groups preempted`, latency spikes, or throughput collapses under load.
+
+**Solutions**:
+
+```bash
+# 1. Enable prefix caching (KV-cache watermark reuse):
+vllm serve MODEL --enable-prefix-caching
+
+# 2. Use FP8 KV cache dtype (halves KV memory):
+vllm serve MODEL --kv-cache-dtype fp8
+
+# 3. Reduce concurrent sequences:
+vllm serve MODEL --max-num-seqs 128  # or lower
+
+# Combined:
+vllm serve MODEL \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8 \
+  --max-num-seqs 128
+```
+
+### MoE FP8 + LoRA producing corrupt / garbled output
+
+**Cause**: Known bug in earlier versions where FP8 quantized MoE models combined with LoRA adapters produced corrupted tokens.
+
+**Solution**: Fixed in v0.24.0. Ensure you are on the latest patch:
+
+```bash
+pip install -U vllm==0.24.0
+# Verify:
+python -c "import vllm; print(vllm.__version__)"
+```
+
+### DeepGEMM warmup takes too long
+
+**Symptom**: Server startup stalls for several minutes during DeepGEMM kernel compilation/warmup.
+
+**Solution**: Skip eager warmup; kernels will JIT-compile at runtime on first use:
+
+```bash
+export VLLM_DEEP_GEMM_WARMUP=skip
+vllm serve MODEL
+```
+
+### Triton autotuning takes too long
+
+**Symptom**: First request triggers prolonged Triton kernel autotuning, causing high TTFT or timeouts.
+
+**Solution**: Force the first config found instead of exhaustive search:
+
+```bash
+export VLLM_TRITON_FORCE_FIRST_CONFIG=1
+vllm serve MODEL
+```
+
+### Large model cold start >20 minutes
+
+**Symptom**: `vllm serve` takes 20+ minutes to become ready for large models (70B+, dense or MoE).
+
+**Solutions** (combine all that apply):
+
+```bash
+# 1. Pre-cache model weights locally:
+huggingface-cli download MODEL_ID  # run once, ahead of time
+
+# 2. Run fully offline to avoid any HF hub checks:
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+# 3. Remove any manual snapshot_download() calls in your startup script;
+#    let vLLM load directly from the HF cache path instead.
+
+# 4. Skip DeepGEMM warmup:
+export VLLM_DEEP_GEMM_WARMUP=skip
+
+# 5. Use fastsafetensors ParallelLoader for faster weight loading:
+pip install fastsafetensors
+export VLLM_USE_FASTSAFETENSORS=1  # if applicable to your setup
+
+# Combined launch:
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 VLLM_DEEP_GEMM_WARMUP=skip \
+  vllm serve MODEL --tensor-parallel-size 8
+```
+
+### NCCL errors with expert parallelism (MoE)
+
+**Symptom**: `NCCL error`, hangs, or crashes when using expert parallel (EP) with MoE models.
+
+**Cause**: NCCL-based expert-parallel load balancing (EPLB) is fragile and can deadlock.
+
+**Solution**: Use DeepEP v2 or NIXL EP instead of NCCL-based EPLB:
+
+```bash
+# DeepEP v2 (preferred for Hopper/Blackwell):
+export VLLM_USE_DEEPEP=1
+vllm serve MODEL --ep-num-token-experts N
+
+# Or NIXL-based expert parallel:
+export VLLM_USE_NIXL_EP=1
+vllm serve MODEL --ep-num-token-experts N
+```
+
+Avoid relying on `NCCL_P2P_DISABLE` workarounds; they mask the underlying issue.
+
+### OOM with multimodal models (vision/audio)
+
+**Symptom**: `torch.cuda.OutOfMemoryError` when serving VLMs or audio models, especially with large batches of image/audio inputs.
+
+**Cause**: Multimodal embeds consume significant KV cache and activation memory.
+
+**Solution**: v0.24.0 enables async scheduling with prompt embeds automatically, reducing peak memory. Ensure you are on v0.24.0+:
+
+```bash
+pip install -U vllm==0.24.0
+vllm serve MODEL  # async scheduling + prompt embeds enabled by default
+```
+
+If still OOM, also reduce concurrency:
+
+```bash
+vllm serve MODEL --max-num-seqs 64 --limit-mm-per-prompt image=2
+```
+
+### Audio decompression bomb (security)
+
+**Cause**: Pre-v0.24.0, crafted audio uploads could trigger excessive decompression (zip-bomb-style attack on audio codecs).
+
+**Solution**: Fixed in v0.24.0. Audio upload size limits are now enforced by default. Ensure you are on v0.24.0+:
+
+```bash
+pip install -U vllm==0.24.0
+```
+
+No additional configuration needed; the limit is applied server-side.
+
+### int32 truncation in GGUF dequantization
+
+**Cause**: Earlier versions had an int32 overflow during GGUF dequantize, causing silent weight corruption or crashes on large GGUF files.
+
+**Solution**: Fixed in v0.24.0. Ensure latest version:
+
+```bash
+pip install -U vllm==0.24.0 vllm-gguf
+```

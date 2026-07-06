@@ -282,3 +282,101 @@ if degradation < 1.0:
 else:
     print("⚠️ Review accuracy loss")
 ```
+ 
+ ## v0.24.0 Quantization Features
+ 
+ ### Online FP8 per-token-per-channel (PTPC)
+ 
+ vLLM v0.24.0 enhances dynamic FP8 quantization with **per-token-per-channel** (PTPC) granularity. No pre-quantized checkpoint is needed — vLLM auto-quantizes weights and activations at runtime using PTPC scaling for improved accuracy over per-tensor dynamic FP8.
+ 
+ ```bash
+ vllm serve meta-llama/Llama-3-70B-Instruct \
+   --quantization fp8
+ # vLLM auto-quantizes at runtime with PTPC; no model preparation required
+ ```
+ 
+ ### fp8_e5m2 KV cache for non-FP8 checkpoints
+ 
+ The `fp8_e5m2` KV cache dtype is now allowed for **non-FP8 checkpoints** (BF16/FP16 models). Previously, FP8 KV cache required an FP8-quantized model; this restriction has been lifted.
+ 
+ ```bash
+ vllm serve meta-llama/Llama-3-70B-Instruct \
+   --kv-cache-dtype fp8 \
+   --dtype bfloat16
+ # Works with BF16/FP16 checkpoints — no --quantization fp8 needed
+ ```
+ 
+ ### NVFP4 MoE
+ 
+ Added **FlashInfer CUTLASS NVFP4 GEMM backend** for NVFP4-quantized MoE layers. The `flashinfer_cutlass` backend is clamped as the NVFP4 MoE backend, providing high-throughput NVFP4 MoE inference on supported GPUs (Blackwell+).
+ 
+ ```bash
+ vllm serve MODEL \
+   --quantization nvfp4 \
+   --moe-backend flashinfer_cutlass
+ ```
+ 
+ ### MXFP4 W4A4 MoE
+ 
+ **MXFP4 W4A4 MoE** (4-bit weights, 4-bit activations) received a **CUTLASS E8M0 scale fix**. This corrects block-scale handling for the E8M0 microscaling format, improving correctness of MXFP4 MoE inference.
+ 
+ ```bash
+ vllm serve MODEL \
+   --quantization mxfp4
+ ```
+ 
+ ### GGUF quantization migrated to plugin
+ 
+ GGUF quantization is **no longer built-in** to vLLM. It has been migrated to a separate plugin package. Install it explicitly if you need GGUF support:
+ 
+ ```bash
+ pip install vllm-gguf
+ # Then serve as usual:
+ vllm serve model.gguf --quantization gguf
+ ```
+ 
+ > **Note**: Check the [vLLM docs](https://docs.vllm.ai) for the latest plugin name and install instructions, as plugin packaging may evolve.
+ 
+ ### Corrupt-output fix for MoE FP8 with LoRAs
+ 
+ Critical bug fix: loading **LoRA adapters** on top of an **FP8-quantized MoE model** previously produced corrupt/garbage outputs. This is fixed in v0.24.0. Ensure you are on v0.24.0+ when combining FP8 MoE with LoRA:
+ 
+ ```bash
+ pip install vllm==0.24.0
+ vllm serve MODEL \
+   --quantization fp8 \
+   --enable-lora \
+   --lora-modules my_lora=/path/to/lora
+ ```
+ 
+ ### FP8 weight layout canonicalized to (K, N)
+ 
+ FP8 quantized weight tensors are now **canonicalized to `(K, N)` layout** (in-features × out-features). This standardizes the internal representation across all FP8 code paths, reducing transpose overhead and simplifying kernel integration. No user action required — this is an internal layout change.
+ 
+ ### modelopt_mixed support extended to Ampere and Turing
+ 
+ The `modelopt_mixed` quantization method (NVIDIA TensorRT-Model Optimizer mixed-precision) now supports:
+ 
+ - **Ampere (SM80–SM86)** — e.g. A100, A10, A30
+ - **Turing (SM75)** — e.g. RTX 20-series, T4
+ 
+ Previously limited to Hopper+; now broadly available on older architectures.
+ 
+ ```bash
+ vllm serve MODEL \
+   --quantization modelopt_mixed
+ ```
+ 
+ ### FP8 MoE re-enabled on NVIDIA Thor
+ 
+ FP8 MoE inference is **re-enabled on NVIDIA Thor** (GB20x) GPUs. A prior regression had disabled this path; v0.24.0 restores it. No additional flags needed — FP8 MoE will work automatically on Thor.
+ 
+ ```bash
+ vllm serve MODEL \
+   --quantization fp8
+ # Works on NVIDIA Thor (GB20x)
+ ```
+ 
+ ### SwiGLU clamp for NVFP4 MoE on non-Blackwell
+ 
+ Added a **SwiGLU activation clamp** for NVFP4 MoE layers running on **non-Blackwell** GPUs. This prevents overflow/NaN in the SwiGLU gate path when operating with NVFP4 reduced precision on architectures without native NVFP4 hardware support. Applied automatically — no user action required.
